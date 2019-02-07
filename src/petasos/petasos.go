@@ -21,6 +21,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"strings"
 
 	"github.com/Comcast/webpa-common/concurrent"
 	"github.com/Comcast/webpa-common/device"
@@ -31,6 +32,7 @@ import (
 	"github.com/Comcast/webpa-common/service/monitor"
 	"github.com/Comcast/webpa-common/service/servicecfg"
 	"github.com/Comcast/webpa-common/service/servicehttp"
+	"github.com/Comcast/webpa-common/xhttp/gate"
 	"github.com/Comcast/webpa-common/xhttp/xcontext"
 	"github.com/go-kit/kit/log/level"
 	"github.com/justinas/alice"
@@ -42,6 +44,9 @@ const (
 	applicationName       = "petasos"
 	release               = "Developer"
 	defaultVnodeCount int = 211
+
+	baseURI = "/api"
+	version = "v1"
 )
 
 // petasos is the driver function for Petasos.  It performs everything main() would do,
@@ -81,33 +86,84 @@ func petasos(arguments []string) int {
 	infoLog.Log("configurationFile", v.ConfigFileUsed())
 
 	var (
-		accessor = new(service.UpdatableAccessor)
+		accessor = service.NewLayeredAccesor(service.DefaultTrafficRouter(), service.DefaultOrder())
 
 		redirectHandler = &servicehttp.RedirectHandler{
-			Logger:       logger,
 			KeyFunc:      device.IDHashParser,
 			Accessor:     accessor,
 			RedirectCode: http.StatusTemporaryRedirect,
 		}
 
-		requestFunc      = logginghttp.SetLogger(redirectHandler.Logger, logginghttp.Header("X-Webpa-Device-Name", "device_id"), logginghttp.Header("Authorization", "authorization"))
+		requestFunc      = logginghttp.SetLogger(logger, logginghttp.Header("X-Webpa-Device-Name", "device_id"), logginghttp.Header("Authorization", "authorization"))
 		decoratedHandler = alice.New(xcontext.Populate(0, requestFunc)).Then(redirectHandler)
 
 		_, petasosServer, done = webPA.Prepare(logger, nil, metricsRegistry, decoratedHandler)
 		signals                = make(chan os.Signal, 1)
+
+		controlRegions = make(map[string]gate.Interface)
 	)
+
+	g := gate.New(true, gate.WithGauge(metricsRegistry.NewGauge("gate_status")))
+
+	vNodeCount := v.Sub("service").GetInt("vnodeCount")
+	if vNodeCount < 1 {
+		vNodeCount = defaultVnodeCount
+	}
 
 	_, err = monitor.New(
 		monitor.WithLogger(logger),
 		monitor.WithEnvironment(e),
 		monitor.WithListeners(
 			monitor.NewMetricsListener(metricsRegistry),
-			monitor.NewAccessorListener(e.AccessorFactory(), accessor.Update),
+			monitor.NewAccessorListener(service.NewConsistentAccessorFactoryWithGate(vNodeCount, g), accessor.UpdatePrimary),
 		),
 	)
 
+	controlRegions["primary"] = g
+
 	if err != nil {
 		errorLog.Log(logging.MessageKey(), "Unable to start service discovery monitor", logging.ErrorKey(), err)
+		return 3
+	}
+
+	redundancy := v.GetStringMap("redundancy")
+	for region := range redundancy {
+		region := strings.TrimSpace(region)
+		if len(region) == 0 {
+			errorLog.Log(logging.MessageKey(), "Unable to initialize empty region")
+			continue
+		}
+		redundancyEnv, err := servicecfg.NewEnvironment(logger, v.Sub("redundancy").Sub(region))
+		vNodeCount := v.Sub("redundancy").Sub(region).GetInt("vnodeCount")
+		if vNodeCount < 1 {
+			vNodeCount = defaultVnodeCount
+		}
+		if err != nil {
+			errorLog.Log(logging.MessageKey(), "Unable to initialize service discovery environment", logging.ErrorKey(), err, "region", region)
+			continue
+		}
+		g := gate.New(true, gate.WithGauge(metricsRegistry.NewGauge("gate_"+region+"_status")))
+
+		_, err = monitor.New(
+			monitor.WithLogger(logging.Debug(logger, "region", region)),
+			monitor.WithEnvironment(redundancyEnv),
+			monitor.WithListeners(
+				monitor.NewKeyAccessorListener(service.NewConsistentAccessorFactoryWithGate(vNodeCount, g), region, accessor.UpdateFailOver),
+			))
+		if err != nil {
+			errorLog.Log(logging.MessageKey(), "Unable to start service discovery monitor", logging.ErrorKey(), err, "region", region)
+			continue
+		}
+
+		infoLog.Log(logging.MessageKey(), "Successfully started service monitor", "region", region)
+		// create Gate
+
+		controlRegions[region] = g
+	}
+
+	err = StartControlServer(logger, controlRegions, v, webPA)
+	if err != nil {
+		logger.Log(level.Key(), level.ErrorValue(), logging.MessageKey(), "Unable to create control server", logging.ErrorKey(), err)
 		return 3
 	}
 
